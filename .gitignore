@@ -14,6 +14,9 @@ sherpa-onnx-zipformer-*/
 silero_vad.onnx
 vosk-model-*/
 
+# tectonic binary (downloaded on demand for local LaTeX rendering)
+bin/
+
 # IDE & misc
 .vscode/
 .idea/

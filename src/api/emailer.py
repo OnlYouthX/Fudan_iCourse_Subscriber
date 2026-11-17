@@ -1,22 +1,19 @@
+import base64
 import re
 import smtplib
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
-from io import BytesIO
-from PIL import Image
 from collections import OrderedDict
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 from html import escape
 from email.utils import formataddr
-from urllib.parse import quote
 
 import markdown
 from pygments.formatters import HtmlFormatter
 
+from src.api.latex_render import render_batch
 from src.runtime import config
 
 _MD_EXTENSIONS= ["tables", "fenced_code", "nl2br", "sane_lists", "codehilite"]
@@ -109,49 +106,6 @@ li { margin-bottom: 4px; }
 
 _MIN_INLINE_HEIGHT = 13  # minimum logical height for inline formulas (px)
 
-_IMAGE_CACHE: dict[str, tuple] = {}
-
-
-def _fetch_latex_image(url: str, dpi: int = 300) -> tuple:
-    """Fetch rendered LaTeX image, return (width, height, png_bytes).
-
-    Width/height are logical display pixels (DPI-adjusted).
-    Returns (None, None, None) on failure.
-    """
-    if url in _IMAGE_CACHE:
-        return _IMAGE_CACHE[url]
-
-    try:
-        scale_factor = dpi / 96.0
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-
-        img = Image.open(BytesIO(response.content))
-        logical_width = max(1, int(img.width / scale_factor))
-        logical_height = max(1, int(img.height / scale_factor))
-
-        result = (logical_width, logical_height, response.content)
-        _IMAGE_CACHE[url] = result
-        return result
-    except Exception as e:
-        print(f"[LaTeX Render] Image fetch failed: {e}")
-        return None, None, None
-
-
-def _prefetch_latex_images(urls: list[str], dpi: int = 300) -> None:
-    """Pre-fetch multiple LaTeX images concurrently.
-
-    Results are stored in ``_IMAGE_CACHE`` so that subsequent calls to
-    ``_fetch_latex_image`` become instant cache hits.
-    """
-    uncached = [u for u in urls if u not in _IMAGE_CACHE]
-    if not uncached:
-        return
-    with ThreadPoolExecutor(max_workers=min(len(uncached), 8)) as pool:
-        futures = {pool.submit(_fetch_latex_image, u, dpi): u for u in uncached}
-        for future in as_completed(futures):
-            future.result()  # trigger any exception logging inside _fetch_latex_image
-
 
 def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
     """Convert Markdown to styled HTML, rendering LaTeX math as images.
@@ -208,24 +162,21 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
         extension_configs=_MD_EXTENSION_CONFIGS,
     )
 
-    # Build URL list and pre-fetch all LaTeX images concurrently
-    # Each entry: (url, latex_content, is_block)
-    latex_info: dict[str, tuple[str, str, bool]] = {}
+    # Render every formula locally (tectonic, with a mathtext fallback).
+    latex_info: dict[str, tuple[str, bool]] = {}
     for key, original in latex_map.items():
         is_block = original.startswith("$$")
         latex_content = original[2:-2] if is_block else original[1:-1]
-        prefix = r"\dpi{300}\bg{white}" if is_block else r"\dpi{300}\bg{white}\inline"
-        url = f"https://latex.codecogs.com/png.latex?{prefix}%20{quote(latex_content)}"
-        latex_info[key] = (url, latex_content, is_block)
+        latex_info[key] = (latex_content, is_block)
 
-    _prefetch_latex_images([info[0] for info in latex_info.values()])
+    rendered = render_batch(list(latex_info.values()))
 
-    for key, (url, latex_content, is_block) in latex_info.items():
-        w, h, img_data = _fetch_latex_image(url)
+    for (key, (latex_content, is_block)), image in zip(latex_info.items(), rendered):
+        w, h, img_data = image if image else (None, None, None)
 
         if is_block:
             if w and h:
-                src = _resolve_src(url, img_data, cid_images)
+                src = _resolve_src(img_data, cid_images)
                 img_tag = (
                     f'<div style="text-align:center;margin:16px 0">'
                     f'<img src="{src}" alt="{escape(latex_content)}" '
@@ -247,7 +198,7 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
                     w = max(1, int(w * scale))
                     h = _MIN_INLINE_HEIGHT
 
-                src = _resolve_src(url, img_data, cid_images)
+                src = _resolve_src(img_data, cid_images)
                 img_tag = (
                     f'<img src="{src}" alt="{escape(latex_content)}" '
                     f'width="{w}" height="{h}" '
@@ -262,14 +213,21 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
     return html
 
 
-def _resolve_src(url: str, img_data: bytes | None,
-                 cid_images: dict | None) -> str:
-    """Return a CID reference if embedding, otherwise the original URL."""
-    if cid_images is not None and img_data:
+def _resolve_src(img_data: bytes | None, cid_images: dict | None) -> str:
+    """Return a CID reference when embedding, else an inline data URI.
+
+    The image is rendered locally, so there is no remote URL to fall back to
+    (and no third-party watermark to worry about): embedding the bytes keeps
+    standalone HTML previews working exactly like the e-mail itself.
+    """
+    if not img_data:
+        return ""
+    if cid_images is not None:
         cid = f"latex-{uuid.uuid4().hex[:12]}"
         cid_images[cid] = img_data
         return f"cid:{cid}"
-    return url
+    encoded = base64.b64encode(img_data).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 class Emailer:
@@ -387,6 +345,10 @@ class Emailer:
 
         # Build MIME: related > alternative > (plain, html) + image attachments
         msg = MIMEMultipart("related")
+        # RFC 2387 requires the "type" parameter on multipart/related; several
+        # webmail renderers (163, 复旦云邮箱) refuse to resolve cid: references
+        # when it is missing and show broken images instead.
+        msg.set_param("type", "multipart/alternative")
         msg["Subject"] = subject
         msg["From"] = formataddr(("iCourse Subscriber", self.sender))
         msg["To"] = self.receiver
@@ -400,8 +362,9 @@ class Emailer:
         for cid, png_data in cid_images.items():
             img_part = MIMEImage(png_data, "png")
             img_part.add_header("Content-ID", f"<{cid}>")
-            img_part.add_header("Content-Disposition", "inline",
-                                filename=f"{cid}.png")
+            # No filename: some webmail clients list inline parts carrying a
+            # filename as regular attachments and then drop the cid: image.
+            img_part.add_header("Content-Disposition", "inline")
             msg.attach(img_part)
 
         if cid_images:
